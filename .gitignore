@@ -12,3 +12,4 @@ wheels/
 #datasets
 competition_package/datasets/*
 competition_package/example_solution/baseline.onnx
+competition_package/my_solution/datasets/*

@@ -26,7 +26,8 @@ class FeatureBuilder:
     """Builds features from sequence history."""
 
     def __init__(self, config: dict):
-        self.windows = config["windows"]  # [5, 10, 20, 50]
+        self.windows = config["windows"]  # [5, 10, 50]
+        self.lags = config.get("lags", [1, 3, 10])  # [1, 3, 10]
         self.key_features = config["key_features"]
         self.all_raw_features = config["all_raw_features"]
         self.feature_columns = config["feature_columns"]
@@ -53,7 +54,7 @@ class FeatureBuilder:
             feat_history = history_arr[:, feat_idx]
 
             for w in self.windows:
-                # Rolling mean
+                # Rolling mean and std
                 if n_steps >= w:
                     roll_mean = np.mean(feat_history[-w:])
                     roll_std = np.std(feat_history[-w:])
@@ -63,20 +64,33 @@ class FeatureBuilder:
 
                 features.append(roll_mean)
                 features.append(roll_std)
+            
+            # Min/max for window 50
+            w = 50
+            if n_steps >= w:
+                roll_max = np.max(feat_history[-w:])
+                roll_min = np.min(feat_history[-w:])
+            else:
+                roll_max = np.max(feat_history)
+                roll_min = np.min(feat_history)
+            
+            features.append(roll_max)
+            features.append(roll_min)
 
-        # 3. Lag and diff features for all features
-        for feat_name in self.all_raw_features:
+        # 3. Lag and diff features for key features
+        for feat_name in self.key_features:
             feat_idx = self.raw_feat_indices[feat_name]
             current_val = current[feat_idx]
 
-            # Lag 1
-            if n_steps > 1:
-                lag1 = history_arr[-2, feat_idx]
-            else:
-                lag1 = 0.0
+            for lag in self.lags:
+                # Lag
+                if n_steps > lag:
+                    lag_val = history_arr[-(lag+1), feat_idx]
+                else:
+                    lag_val = 0.0
 
-            features.append(lag1)
-            features.append(current_val - lag1)  # diff
+                features.append(lag_val)
+                features.append(current_val - lag_val)  # diff
 
         # 4. Spread features
         p0_idx = self.raw_feat_indices["p0"]
@@ -87,18 +101,35 @@ class FeatureBuilder:
         features.append(current[p0_idx] - current[p6_idx])  # spread_p0_p6
         features.append(current[v0_idx] - current[v6_idx])  # spread_v0_v6
 
-        # 5. Volume imbalance
+        # 5. Mid price features
+        mid_price = (current[p0_idx] + current[p6_idx]) / 2
+        if n_steps > 1:
+            prev_mid = (history_arr[-2, p0_idx] + history_arr[-2, p6_idx]) / 2
+        else:
+            prev_mid = 0.0
+        
+        features.append(mid_price)
+        features.append(prev_mid)
+        features.append(mid_price - prev_mid)
+
+        # 6. Volume imbalance
         bid_vol = sum(current[self.raw_feat_indices[f"v{i}"]] for i in range(6))
         ask_vol = sum(current[self.raw_feat_indices[f"v{i}"]] for i in range(6, 12))
         vol_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
+        total_vol = bid_vol + ask_vol
         features.append(vol_imbalance)
+        features.append(total_vol)
 
-        # 6. Trade intensity
+        # 7. Trade features
         trade_vol = sum(current[self.raw_feat_indices[f"dv{i}"]] for i in range(4))
+        trade_price_mean = np.mean([current[self.raw_feat_indices[f"dp{i}"]] for i in range(4)])
         features.append(trade_vol)
+        features.append(trade_price_mean)
 
-        # 7. Normalized step
-        features.append(step_in_seq / 999.0)
+        # 8. Normalized step
+        step_norm = step_in_seq / 999.0
+        features.append(step_norm)
+        features.append(step_norm ** 2)
 
         return np.array(features, dtype=np.float32)
 
@@ -122,6 +153,9 @@ class PredictionModel:
         config_path = os.path.join(base_dir, "config.pkl")
         with open(config_path, "rb") as f:
             self.config = pickle.load(f)
+        
+        # Check if t1 uses relative predictions
+        self.t1_is_relative = self.config.get("t1_is_relative", False)
 
         # Initialize feature builder
         self.feature_builder = FeatureBuilder(self.config)
@@ -131,6 +165,8 @@ class PredictionModel:
         self.model_t1 = lgb.Booster(model_file=os.path.join(base_dir, "model_t1.txt"))
 
         print(f"Loaded LightGBM models from {base_dir}")
+        if self.t1_is_relative:
+            print("t1 model uses relative change predictions")
 
     def predict(self, data_point: DataPoint) -> np.ndarray | None:
         """Make prediction for the given data point."""
@@ -155,9 +191,22 @@ class PredictionModel:
         # Reshape for prediction (1, n_features)
         X = features.reshape(1, -1)
 
-        # Predict
+        # Predict t0 (absolute value)
         pred_t0 = self.model_t0.predict(X)[0]
-        pred_t1 = self.model_t1.predict(X)[0]
+        
+        # Predict t1
+        pred_t1_relative = self.model_t1.predict(X)[0]
+        
+        # If t1 is relative, convert to absolute using mid_price as reference
+        if self.t1_is_relative:
+            # Get reference price (mid_price from current state)
+            p0_idx = self.feature_builder.raw_feat_indices["p0"]
+            p6_idx = self.feature_builder.raw_feat_indices["p6"]
+            current_state = data_point.state
+            reference_price = (current_state[p0_idx] + current_state[p6_idx]) / 2
+            pred_t1 = reference_price * (1 + pred_t1_relative)
+        else:
+            pred_t1 = pred_t1_relative
 
         return np.array([pred_t0, pred_t1], dtype=np.float32)
 
