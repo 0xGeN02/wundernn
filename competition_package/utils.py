@@ -1,7 +1,13 @@
+"""
+Utility functions for the competition package.
+"""
+
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
-from dataclasses import dataclass
+
 
 def weighted_pearson_correlation(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
@@ -51,12 +57,14 @@ def weighted_pearson_correlation(y_true: np.ndarray, y_pred: np.ndarray) -> floa
         return 0.0
 
     corr = cov / (np.sqrt(var_true) * np.sqrt(var_pred))
-    
+
     return float(corr)
 
 
 @dataclass
 class DataPoint:
+    """Data point for prediction."""
+
     seq_ix: int
     step_in_seq: int
     need_prediction: bool
@@ -65,12 +73,17 @@ class DataPoint:
 
 
 class PredictionModel:
-    def predict(self, data_point: DataPoint) -> np.ndarray:
+    """Base class for prediction models."""
+
+    def predict(self, _: DataPoint) -> np.ndarray:
+        """Make a prediction for the given data point."""
         # return dummy prediction
         return np.zeros(2)
 
 
 class ScorerStepByStep:
+    """Scorer that evaluates predictions step by step."""
+
     def __init__(self, dataset_path: str):
         self.dataset = pd.read_parquet(dataset_path)
 
@@ -82,6 +95,7 @@ class ScorerStepByStep:
         self.targets = self.dataset.columns[35:]
 
     def score(self, model: PredictionModel) -> dict:
+        """Score the model on the dataset."""
         predictions = []
         targets = []
 
@@ -93,7 +107,7 @@ class ScorerStepByStep:
             step_in_seq = row[1]
             need_prediction = row[2]
             lob_data = row[3:35]  # 32 features
-            labels = row[35:]     # 2 targets
+            labels = row[35:]  # 2 targets
             #
             data_point = DataPoint(seq_ix, step_in_seq, need_prediction, lob_data)
             prediction = model.predict(data_point)
@@ -107,6 +121,7 @@ class ScorerStepByStep:
         return self.calc_metrics(np.array(predictions), np.array(targets))
 
     def check_prediction(self, data_point: DataPoint, prediction: np.ndarray):
+        """Check the validity of the prediction."""
         if not data_point.need_prediction:
             if prediction is not None:
                 raise ValueError(f"Prediction is not needed for {data_point}")
@@ -121,6 +136,7 @@ class ScorerStepByStep:
             )
 
     def calc_metrics(self, predictions: np.ndarray, targets: np.ndarray) -> dict:
+        """Calculate metrics for the predictions."""
         scores = {}
         for ix_target, target_name in enumerate(self.targets):
             scores[target_name] = weighted_pearson_correlation(
